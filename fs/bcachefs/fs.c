@@ -1428,51 +1428,73 @@ static void bch2_evict_inode(struct inode *vinode)
 	}
 }
 
-void bch2_evict_subvolume_inodes(struct bch_fs *c,
-				 snapshot_id_list *s)
+void bch2_evict_subvolume_inodes(struct bch_fs *c, snapshot_id_list *s)
 {
 	struct super_block *sb = c->vfs_sb;
-	struct inode *inode;
+	struct inode *inode, **i;
+	DARRAY(struct inode *) grabbed;
+	bool clean_pass = false, this_pass_clean;
 
-	spin_lock(&sb->s_inode_list_lock);
-	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
-		if (!snapshot_list_has_id(s, to_bch_ei(inode)->ei_subvol) ||
-		    (inode->i_state & I_FREEING))
-			continue;
+	/*
+	 * Initially, we scan for inodes without I_DONTCACHE, then mark them to
+	 * be pruned with d_mark_dontcache().
+	 *
+	 * Once we've had a clean pass where we didn't find any inodes without
+	 * I_DONTCACHE, we wait for them to be freed:
+	 */
 
-		d_mark_dontcache(inode);
-		d_prune_aliases(inode);
-	}
-	spin_unlock(&sb->s_inode_list_lock);
+	darray_init(&grabbed);
+	darray_make_room(&grabbed, 1024);
 again:
 	cond_resched();
+	this_pass_clean = true;
+
 	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
-		if (!snapshot_list_has_id(s, to_bch_ei(inode)->ei_subvol) ||
-		    (inode->i_state & I_FREEING))
+		if ((inode->i_state & I_FREEING) ||
+		    !snapshot_list_has_id(s, to_bch_ei(inode)->ei_subvol))
 			continue;
 
 		if (!(inode->i_state & I_DONTCACHE)) {
+			this_pass_clean = false;
+
 			d_mark_dontcache(inode);
 			d_prune_aliases(inode);
-		}
 
-		spin_lock(&inode->i_lock);
-		if (snapshot_list_has_id(s, to_bch_ei(inode)->ei_subvol) &&
-		    !(inode->i_state & I_FREEING)) {
+			/*
+			 * If i_count was zero, we have to take and release a
+			 * ref in order for I_DONTCACHE to be noticed and the
+			 * inode to be dropped;
+			 */
+
+			if (!atomic_read(&inode->i_count) &&
+			    igrab(inode) &&
+			    darray_push_gfp(&grabbed, inode, GFP_ATOMIC|__GFP_NOWARN))
+				break;
+		} else if (clean_pass && this_pass_clean) {
 			wait_queue_head_t *wq = bit_waitqueue(&inode->i_state, __I_NEW);
 			DEFINE_WAIT_BIT(wait, &inode->i_state, __I_NEW);
+
 			prepare_to_wait(wq, &wait.wq_entry, TASK_UNINTERRUPTIBLE);
 			spin_unlock(&inode->i_lock);
 			spin_unlock(&sb->s_inode_list_lock);
+
 			schedule();
 			finish_wait(wq, &wait.wq_entry);
 			goto again;
 		}
-
-		spin_unlock(&inode->i_lock);
 	}
 	spin_unlock(&sb->s_inode_list_lock);
+
+	darray_for_each(grabbed, i)
+		iput(*i);
+	grabbed.nr = 0;
+
+	clean_pass = this_pass_clean;
+	if (!clean_pass)
+		goto again;
+
+	darray_exit(&grabbed);
 }
 
 static int bch2_statfs(struct dentry *dentry, struct kstatfs *buf)
